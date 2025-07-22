@@ -30,7 +30,7 @@
 
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union, cast
 
-from . import ArrayObject, DictionaryObject, IndirectObject, PdfObject, TextStringObject
+from . import ArrayObject, DictionaryObject, IndirectObject, NullObject, PdfObject, TextStringObject
 
 if TYPE_CHECKING:
     from .._page import PageObject
@@ -41,14 +41,35 @@ if TYPE_CHECKING:
 class NamedReferenceLink:
     """Named reference link being preserved until we can resolve it correctly."""
 
-    def __init__(self, reference: TextStringObject, source_pdf: "PdfReader") -> None:
+    def __init__(self, reference: TextStringObject, page: "PageObject") -> None:
         """reference: TextStringObject with named reference"""
         self._reference = reference
-        self._source_pdf = source_pdf
+
+        # to work out where the reference points we need to find the
+        # source PDF which the reference is pointing to.  this *can*
+        # be the PDF the page containing the link comes from, but it
+        # may also be some other PDF merged into this page, so we need
+        # to do a little search
+        destination = self._find_page_in(page.pdf)
+
+        if not destination:
+            for src_page in page._merged_in_pages:
+                destination = self._find_page_in(src_page.pdf)
+                break
+
+        if destination and not isinstance(destination.dest_array[0], NullObject):
+            self._referenced_page = destination.dest_array[0]
+        else:
+            self._referenced_page = None
+
+    def _find_page_in(self, pdf: "Optional[PdfReader]"):
+        if not pdf:
+            return None
+        return pdf.named_destinations.get(str(self._reference))
 
     def find_referenced_page(self) -> Union[IndirectObject, None]:
-        destination = self._source_pdf.named_destinations.get(str(self._reference))
-        return destination.page if destination else None
+        if self._referenced_page:
+            return self._referenced_page.indirect_reference
 
     def patch_reference(self, target_pdf: "PdfWriter", new_page: IndirectObject) -> None:
         """target_pdf: PdfWriter which the new link went into"""
@@ -90,7 +111,6 @@ def extract_links(new_page: "PageObject", old_page: "PageObject") -> List[Tuple[
 
 
 def _build_link(indirect_object: IndirectObject, page: "PageObject") -> Optional[ReferenceLink]:
-    src = cast("PdfReader", page.pdf)
     link = cast(DictionaryObject, indirect_object.get_object())
     if (not isinstance(link, DictionaryObject)) or link.get("/Subtype") != "/Link":
         return None
@@ -100,17 +120,17 @@ def _build_link(indirect_object: IndirectObject, page: "PageObject") -> Optional
         if action.get("/S") != "/GoTo":
             return None
 
-        return _create_link(action["/D"], src)
+        return _create_link(action["/D"], page)
 
     if "/Dest" in link:
-        return _create_link(link["/Dest"], src)
+        return _create_link(link["/Dest"], page)
 
     return None  # Nothing to do here
 
 
-def _create_link(reference: PdfObject, source_pdf: "PdfReader")-> Optional[ReferenceLink]:
+def _create_link(reference: PdfObject, page: "PageObject")-> Optional[ReferenceLink]:
     if isinstance(reference, TextStringObject):
-        return NamedReferenceLink(reference, source_pdf)
+        return NamedReferenceLink(reference, page)
     if isinstance(reference, ArrayObject):
         return DirectReferenceLink(reference)
     return None
